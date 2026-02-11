@@ -53,33 +53,27 @@ EXPERIMENTS = [
 ]
 
 # ============================================================================
-# HYPERPARAMETERS (FROM BASELINE SWEEP BEST CONFIG)
+# HYPERPARAMETERS
 # ============================================================================
 
 SEED = 42
 BATCH_SIZE = 32  # Balanced for VRAM
 IMGSZ = 640
-
-# ========== BASELINE SWEEP BEST CONFIG ==========
-# These are YOUR actual baseline sweep winners
-LR = 0.005                       # From baseline sweep winner ✓
-WARMUP_EPOCHS = 2                # From baseline sweep winner ✓
-OPTIMIZER_TYPE = 'sgd'           # From baseline sweep winner ✓
-WEIGHT_DECAY = 0.005             # From baseline sweep winner ✓
-SCHEDULER_FACTOR = 0.2           # From baseline sweep winner ✓
-SCHEDULER_PATIENCE = 10          # From baseline sweep winner ✓
-EARLY_STOP_PATIENCE_BASELINE = 20  # From baseline sweep winner ✓
+LR = 0.005  # Base learning rate
+WARMUP_EPOCHS = 3  # Warmup period for stability
 
 # ========== DOING_HISTORY MODE (Adaptive Plateau Detection) ==========
 # Best for: Maximizing performance, adding dendrites when truly needed
 # OPTIMIZED: Updated from WandB sweep results (best config)
 HISTORY_MAX_EPOCHS = 500
+HISTORY_EARLY_STOP_PATIENCE_BASELINE = 12
 HISTORY_EARLY_STOP_PATIENCE_DENDRITIC = 50  # From sweep: early_stop_patience=50
 HISTORY_MAX_DENDRITES = 4  # From sweep: max_dendrites=4
 HISTORY_N_EPOCHS_TO_SWITCH = 15  # From sweep: n_epochs_to_switch=15
 HISTORY_P_EPOCHS_TO_SWITCH = 15  # IGNORED for Open Source GD (only used in PerforatedBP)
 HISTORY_HISTORY_LOOKBACK = 3  # From sweep: history_lookback=3 ✓
 HISTORY_IMPROVEMENT_THRESHOLD = [0.001, 0.0001, 0]  # From sweep: [0.001, 0.0001, 0]
+HISTORY_SCHEDULER_PATIENCE = 5  # Scheduler patience for HISTORY mode (< n_epochs_to_switch)
 
 # ========== DOING_FIXED MODE (Fixed Epoch Intervals) ==========
 # Best for: Systematic experiments, predictable dendrite addition
@@ -254,13 +248,13 @@ def run_single_experiment(
         if max_dendrites is None:
             max_dendrites = HISTORY_MAX_DENDRITES
         if baseline_patience is None:
-            baseline_patience = EARLY_STOP_PATIENCE_BASELINE  # From baseline sweep: 10
+            baseline_patience = HISTORY_EARLY_STOP_PATIENCE_BASELINE
         if dendritic_patience is None:
             dendritic_patience = HISTORY_EARLY_STOP_PATIENCE_DENDRITIC
         max_epochs = HISTORY_MAX_EPOCHS
         improvement_threshold = HISTORY_IMPROVEMENT_THRESHOLD
         history_lookback = HISTORY_HISTORY_LOOKBACK
-        scheduler_patience = SCHEDULER_PATIENCE  # From baseline sweep: 3
+        scheduler_patience = HISTORY_SCHEDULER_PATIENCE  # History mode: 5 epochs
     
     print("\n" + "=" * 70)
     print(f"  EXPERIMENT: {exp_name}")
@@ -411,9 +405,8 @@ def run_single_experiment(
     from pai_yolo_training import train_pai_yolo
     
     # Call the UNIFIED training loop
-    # OPTIMIZED: All parameters now match baseline sweep best config
-    # NOTE: Now returns 3 values - model, val_score, test_score
-    trained_model, best_map50, test_map50 = train_pai_yolo(
+    # OPTIMIZED: All parameters now match WandB sweep best config
+    trained_model, best_map50 = train_pai_yolo(
         data_yaml=str(subset_yaml_path),
         epochs=max_epochs,  # Use mode-specific max_epochs
         batch_size=BATCH_SIZE,
@@ -429,62 +422,88 @@ def run_single_experiment(
         max_dendrites=max_dendrites,
         improvement_threshold=improvement_threshold,  # Mode-specific
         history_lookback=history_lookback,  # Mode-specific
-        early_stop_patience=dendritic_patience if use_pai else EARLY_STOP_PATIENCE_BASELINE,
+        early_stop_patience=dendritic_patience if use_pai else baseline_patience,
         use_pai=use_pai,
         use_perforated_bp=not use_opensource_gd,  # opensource_gd=True means perforated_bp=False
         switch_mode=switch_mode,  # Pass switch_mode to training function
-        scheduler_patience=SCHEDULER_PATIENCE,  # From baseline sweep: 3
-        # ========== BASELINE SWEEP BEST CONFIG ==========
-        optimizer_type=OPTIMIZER_TYPE,  # From baseline sweep: 'sgd'
-        weight_decay=WEIGHT_DECAY,  # From baseline sweep: 0.01
-        scheduler_factor=SCHEDULER_FACTOR,  # From baseline sweep: 0.5
-        # ========== PAI-SPECIFIC ==========
-        candidate_weight_init=0.005 if use_pai else None,  # From PAI sweep: 0.005
-        pai_forward_function="sigmoid" if use_pai else None,  # From PAI sweep: "sigmoid"
-        find_best_lr=True if use_pai else False,  # PAI auto LR search enabled
-        # CRITICAL FIX: Set dendrite_lr = None to use base_lr (no 10x jump!)
-        # The working config had base_lr=0.005, dendrite_lr=0.005 (same, no jump)
-        # Our baseline has base_lr=0.0005, so dendrite_lr should also be 0.0005
-        dendrite_lr=None if use_pai else None,  # None = use base LR (no jump)
+        scheduler_patience=scheduler_patience,  # Mode-specific scheduler patience
+        # From sweep best config:
+        candidate_weight_init=0.005 if use_pai else None,  # From sweep: 0.005
+        pai_forward_function="sigmoid" if use_pai else None,  # From sweep: "sigmoid"
+        find_best_lr=True if use_pai else False  # From sweep: true (PAI auto LR search)
     )
         
-    # TEST EVALUATION IS NOW DONE INSIDE train_pai_yolo()
-    # The returned test_map50 is from correct PAI evaluation (using UPA.load_system)
-    print(f"\n[RESULTS] Test evaluation completed inside training function")
-    print(f"  ⭐️ Test mAP50: {test_map50:.4f}")
-    print(f"  Best Val mAP50: {best_map50:.4f}")
+    # TEST EVALUATION
+    # ---------------
+    # NOTE: train_pai_yolo() now loads best_model_state before returning,
+    # so trained_model already has the best weights. We just evaluate directly.
+    print(f"\n[TESTING] Evaluating best model on Test set...")
     
-    # Initialize results dictionary with returned values
+    # Initialize results dictionary
     results = {
         'experiment': exp_name,
         'data_pct': data_pct,
         'use_pai': use_pai,
         'best_val_map50': best_map50,
-        'test_map50': test_map50,
         'best_epoch': 0,
         'total_epochs': 0
     }
     
-    # Try to get best_epoch from saved checkpoint
-    best_pt = exp_dir / "best_model.pt"
-    if best_pt.exists():
-        try:
+    try:
+        # The trained_model returned from train_pai_yolo already has best weights loaded
+        # (best_model_state is restored before returning)
+        
+        val_yolo = YOLO('yolo11n.pt')  # Load base YOLO wrapper
+        val_yolo.model = trained_model  # Inject our trained model with best weights
+        
+        # For PAI models: Prevent fuse() call by pretending model is already fused
+        # This allows full yolo.val() output while preventing PAI module errors
+        if use_pai:
+            trained_model.is_fused = lambda: True
+        
+        # FULL TEST EVALUATION with detailed output (same as baseline!)
+        # This shows class breakdown, model summary, speed etc.
+        print(f"[Test] Final evaluation of best model...")
+        test_results = val_yolo.val(
+            data=str(subset_yaml_path),
+            imgsz=IMGSZ,
+            split='test',
+            plots=False,
+            save=False,
+            verbose=True  # Show full detailed output
+        )
+        test_map50 = float(test_results.box.map50)
+        print(f"  Test mAP50: {test_map50:.4f}")
+        
+        # Restore is_fused for PAI models
+        if use_pai and hasattr(trained_model, 'is_fused'):
+            delattr(trained_model, 'is_fused')
+        
+        results["test_map50"] = test_map50
+        results["best_val_map50"] = best_map50
+        
+        # Try to get best_epoch from saved checkpoint
+        best_pt = exp_dir / "best_model.pt"
+        if best_pt.exists():
             checkpoint = torch.load(str(best_pt), map_location=device)
             results["best_epoch"] = checkpoint.get('epoch', 0)
-        except:
-            pass
-    
-    # Log to WandB if initialized
-    if wandb_initialized:
-        try:
-            import wandb
-            wandb.log({
-                "test/mAP50": test_map50,
-                "val/best_mAP50": best_map50,
-                "best_epoch": results.get("best_epoch", 0)
-            })
-        except:
-            pass
+        
+        # Log to WandB if initialized
+        if wandb_initialized:
+            try:
+                import wandb
+                wandb.log({
+                    "test/mAP50": test_map50,
+                    "val/best_mAP50": best_map50,
+                    "best_epoch": results.get("best_epoch", 0)
+                })
+            except:
+                pass
+    except Exception as e:
+        print(f"⚠️ Warning: Test evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        results["test_map50"] = 0.0
 
     # Finish WandB (only if it was initialized)
     if wandb_initialized:
@@ -526,7 +545,7 @@ def main():
                         help="Epochs in P-phase (PerforatedBP only, ignored in open source GD, default: 9)")
     parser.add_argument("--max-dendrites", type=int, default=None,
                         help="Maximum dendrites per neuron (default: 2)")
-    parser.add_argument("--opensource-gd", action="store_true", default=True,
+    parser.add_argument("--opensource-gd", action="store_true",
                         help="Use open source gradient descent (instant P-phase) instead of PerforatedBP")
     parser.add_argument("--mode", type=str, default="DOING_HISTORY",
                         choices=["DOING_HISTORY", "DOING_FIXED"],
@@ -551,7 +570,7 @@ def main():
         default_n_epochs = HISTORY_N_EPOCHS_TO_SWITCH
         default_p_epochs = HISTORY_P_EPOCHS_TO_SWITCH
         default_max_dendrites = HISTORY_MAX_DENDRITES
-        default_baseline_patience = EARLY_STOP_PATIENCE_BASELINE  # Use baseline sweep value
+        default_baseline_patience = HISTORY_EARLY_STOP_PATIENCE_BASELINE
         default_dendritic_patience = HISTORY_EARLY_STOP_PATIENCE_DENDRITIC
     
     # Override defaults with command-line args if provided

@@ -125,8 +125,8 @@ except ImportError as e:
 
 AUGMENTATION_CONFIG = {
     'mosaic': 1.0,        # Mosaic augmentation probability
-    'mixup': 0.15,        # Mixup augmentation probability (matches sweep_baseline.py)
-    'copy_paste': 0.3,    # Copy-paste augmentation probability (matches sweep_baseline.py)
+    'mixup': 0.0,         # Mixup augmentation probability  
+    'copy_paste': 0.0,    # Copy-paste augmentation probability
     'degrees': 0.0,       # Rotation degrees
     'translate': 0.1,     # Translation fraction
     'scale': 0.5,         # Scale +/- gain
@@ -137,7 +137,7 @@ AUGMENTATION_CONFIG = {
     'hsv_h': 0.015,       # HSV-Hue augmentation
     'hsv_s': 0.7,         # HSV-Saturation augmentation
     'hsv_v': 0.4,         # HSV-Value augmentation
-    'erasing': 0.4,       # Random erasing probability (matches sweep_baseline.py)
+    'erasing': 0.0,       # Random erasing probability
 }
 
 
@@ -545,11 +545,6 @@ def setup_pai_config(
     # DOING_HISTORY: Adaptive plateau detection - adds dendrite when improvement slows
     # DOING_FIXED: Fixed epoch intervals - adds dendrite at regular intervals (e.g., every 50 epochs)
     
-    print(f"\n[DEBUG] Received switch_mode parameter: '{switch_mode}'")
-    print(f"[DEBUG] After upper(): '{switch_mode.upper()}'")
-    print(f"[DEBUG] Has DOING_FIXED attribute: {hasattr(GPA.pc, 'DOING_FIXED')}")
-    print(f"[DEBUG] Has DOING_HISTORY attribute: {hasattr(GPA.pc, 'DOING_HISTORY')}")
-    
     if switch_mode.upper() == 'DOING_FIXED':
         # DOING_FIXED: Predictable dendrite addition at fixed epoch intervals
         # Best for: Systematic experimentation, comparing dendrite effects at specific stages
@@ -610,8 +605,11 @@ def setup_pai_config(
         GPA.pc.set_improvement_threshold(improvement_threshold)
         print(f"  Improvement Threshold: {improvement_threshold} (from sweep optimization)")
     
-    # NOTE: candidate_weight_init is now passed as parameter and set after setup_pai_config()
-    # in train_pai_yolo() lines 1669-1671, so we don't hardcode it here
+    # Dendrite weight initialization - from WandB sweep (best config)
+    # Lower value = gentler dendrite integration, reduces disruption to trained weights
+    if hasattr(GPA.pc, 'set_candidate_weight_initialization_multiplier'):
+        GPA.pc.set_candidate_weight_initialization_multiplier(0.005)  # From sweep: 0.005
+        print(f"  Candidate Weight Init: 0.005 (from sweep optimization)")
     
     # CRITICAL: Silence BatchNorm warnings
     if hasattr(GPA.pc, 'set_unwrapped_modules_confirmed'):
@@ -629,42 +627,23 @@ def setup_pai_config(
         GPA.pc.set_using_safe_tensors(True)
         print("  SafeTensors Mode: ENABLED (fixes PB .item() error)")
     
-    # ========== MODULE CONFIGURATION (Per PAI Best Practices §2.1) ==========
-    
-    # FIX: Ultralytics' Conv class ALREADY wraps [Conv2d, BatchNorm2d, SiLU]
-    # with forward: self.act(self.bn(self.conv(x)))
-    # By adding 'Conv' to module_names_to_convert, PAI treats the WHOLE Conv
-    # block as one unit. Dendrites are added AFTER the full conv+bn+act output.
-    # BatchNorm2d is naturally INSIDE the converted block, not just tracked.
-    #
-    # BEFORE (wrong): PAI drilled inside Conv, converted Conv2d alone, tracked BN:
-    #   x -> Conv2d -> [+dendrite HERE] -> BatchNorm2d -> SiLU  (BN sees corrupted input!)
-    #
-    # AFTER (correct): PAI converts entire Conv as one block:
-    #   x -> Conv{Conv2d -> BatchNorm2d -> SiLU} -> [+dendrite HERE]  (BN is clean!)
-    #
-    # For higher-level blocks (C3k2, C3k, etc.): Conv modules inside them are
-    # already part of the parent converted block, so no double-conversion.
-    # For standalone Conv modules (model.0, model.1, model.3, model.5, model.7,
-    # model.17, model.20): These are now properly converted with BN included.
+    # ========== MODULE CONFIGURATION (Matching PAI Official Examples) ==========
+    # Like EfficientNet example uses: append_module_names_to_convert(['MBConv', 'Conv2dNormActivation'])
+    # We explicitly tell PAI which YOLO module types should get dendrites
     #
     # YOLOv11n Module Types:
-    # - CONVERT (dendrites added): Conv, C3k2, C3k, C2PSA, Bottleneck, PSABlock
-    # - TRACK (no dendrites):      SiLU, Identity, Upsample, MaxPool2d, Concat
-    #   (BatchNorm2d is NOT tracked separately — it's inside converted Conv blocks)
-    # - EXCLUDE: Detect, DFL, SPPF (detection-specific, tracked by ID)
+    # - CONVERT (add dendrites): C3k2, C3k, C2PSA, Conv, Bottleneck, PSABlock, DWConv
+    # - TRACK (no dendrites): BatchNorm2d, SiLU, Identity, Upsample, MaxPool2d
+    # - EXCLUDE: Detect, DFL, SPPF (detection-specific)
     
-    # Main convertible blocks - ADD DENDRITES TO THESE
-    # 'Conv' = Ultralytics Conv(Conv2d+BN+SiLU) — the key fix for norm wrapping
-    main_blocks_to_convert = ['Conv', 'C3k2', 'C3k', 'C2PSA', 'Bottleneck', 'PSABlock']
+    # Main feature extraction blocks - ADD DENDRITES TO THESE
+    main_blocks_to_convert = ['C3k2', 'C3k', 'C2PSA', 'Bottleneck', 'PSABlock']
     if hasattr(GPA.pc, 'append_module_names_to_convert'):
         GPA.pc.append_module_names_to_convert(main_blocks_to_convert)
         print(f"  Module Types to CONVERT: {main_blocks_to_convert}")
-        print(f"  ↳ 'Conv' includes BatchNorm2d+SiLU — dendrites added AFTER normalization")
     
-    # Non-learning layers — TRACK for PAI bookkeeping (no dendrites)
-    # BatchNorm2d is NOT here — it's INSIDE converted Conv modules now
-    layers_to_track = ['SiLU', 'Identity', 'Upsample', 'MaxPool2d', 'Concat']
+    # Normalization/activation layers - TRACK but don't add dendrites
+    layers_to_track = ['BatchNorm2d', 'SiLU', 'Identity', 'Upsample', 'MaxPool2d', 'Concat']
     if hasattr(GPA.pc, 'append_module_names_to_track'):
         GPA.pc.append_module_names_to_track(layers_to_track)
         print(f"  Module Types to TRACK: {layers_to_track}")
@@ -696,11 +675,20 @@ def setup_pai_config(
         GPA.pc.set_candidate_grad_clipping(1.0)
         print("  Candidate Grad Clipping: 1.0 (prevents NaN in dendrite outputs)")
     
-    # NOTE: candidate_weight_init is passed as parameter to train_pai_yolo()
-    # and set after setup_pai_config() is called (lines 1669-1671)
+    # CRITICAL FIX FOR HUGE DROPS: Reduce dendrite weight initialization
+    # Default is 0.01, but this causes massive disruption when dendrites are added
+    # PAI docs recommend trying 0.1 or 0.01 - we go even smaller for YOLO stability
+    if hasattr(GPA.pc, 'set_candidate_weight_initialization_multiplier'):
+        GPA.pc.set_candidate_weight_initialization_multiplier(0.001)
+        print("  Dendrite Weight Init: 0.001 (10x smaller than default for stability)")
     
-    # NOTE: pai_forward_function is passed as parameter to train_pai_yolo()
-    # and set after setup_pai_config() is called (lines 1673-1680)
+    # CRITICAL FIX FOR HUGE DROPS: Set PAI forward function to match YOLO's activations
+    # Default is sigmoid, but YOLO uses SiLU throughout - ReLU is closest match
+    # This prevents activation mismatch that causes output corruption
+    if hasattr(GPA.pc, 'set_pai_forward_function'):
+        import torch
+        GPA.pc.set_pai_forward_function(torch.relu)
+        print("  PAI Forward Function: ReLU (matches YOLO's SiLU activation pattern)")
     
     # Suppress covariance NaN warnings (informational, not critical)
     if hasattr(GPA.pc, 'set_covariance_warning_silenced'):
@@ -712,12 +700,11 @@ def setup_pai_config(
         GPA.pc.set_candidate_warning_silenced(True)
         print("  Candidate Output Warnings: SILENCED")
     
-    # NOTE: BatchNorm modules are NOT tracked separately anymore.
-    # They are INSIDE converted Conv modules (Conv wraps Conv2d+BN+SiLU).
-    # PAI sees them as internal components of the converted Conv block.
-    # If PAI still warns about untracked BatchNorm params, re-enable tracking below:
-    # GPA.pc.append_module_names_to_track(["BatchNorm2d", "BatchNorm1d", "SyncBatchNorm"])
-    print("  BatchNorm: Inside converted Conv blocks (not tracked separately)")
+    # Add BatchNorm modules to tracking (they have params but shouldn't get dendrites)
+    # This silences "Parameter does not have parameter_type attribute" warnings
+    if hasattr(GPA.pc, 'append_module_names_to_track'):
+        GPA.pc.append_module_names_to_track(["BatchNorm2d", "BatchNorm1d", "SyncBatchNorm"])
+        print("  BatchNorm Tracking: ENABLED (suppresses param warnings)")
     
     # CRITICAL FOR YOLO: Handle duplicate module pointers
     # YOLOv11n often shares activation modules between layers (e.g., SiLU)
@@ -922,15 +909,6 @@ def check_gradients(model: nn.Module):
             param.requires_grad = True
         print("[GradCheck] Force-enabled gradients on all parameters.")
 
-
-# NOTE: wrap_normalization_layers_in_sequentials() was REMOVED.
-# It was over-engineering. The correct fix is simply adding 'Conv' to
-# module_names_to_convert in setup_pai_config(). The Ultralytics Conv class
-# already wraps Conv2d+BatchNorm2d+SiLU, so PAI treating Conv as a whole
-# converted block achieves the same result without modifying model structure.
-# (See setup_pai_config() module configuration section for full explanation.)
-
-
 def initialize_pai_model(
     model: nn.Module,
     save_name: str = "PAI_YOLO",
@@ -1086,10 +1064,6 @@ def initialize_pai_model(
         GPA.pc.append_module_ids_to_track(detection_head_modules)
         print(f"[PAI] Excluding {len(detection_head_modules)} critical YOLO modules from conversion (head + neck + SPPF)")
     
-    # NOTE: No manual PAISequential wrapping needed here.
-    # BatchNorm is handled by converting 'Conv' (Ultralytics class) as a whole
-    # block in setup_pai_config(). See module configuration comments there.
-    
     # Initialize PAI - use ONLY the basename to avoid path concatenation bugs
     # making_graphs=True saves all PAI visualization artifacts
     try:
@@ -1141,9 +1115,7 @@ def setup_pai_optimizer(
     model: nn.Module,
     lr: float = 0.001,
     weight_decay: float = 0.0,
-    scheduler_patience: int = 10,
-    scheduler_factor: float = 0.1,  # Scheduler LR reduction factor
-    optimizer_type: str = 'adamw'  # Optimizer type: 'sgd', 'adamw', or 'adam'
+    scheduler_patience: int = 10
 ) -> Tuple[torch.optim.Optimizer, Any]:
     """
     Setup optimizer and scheduler through PAI tracker.
@@ -1157,8 +1129,6 @@ def setup_pai_optimizer(
         lr: Learning rate
         weight_decay: Weight decay (default 0 for PAI)
         scheduler_patience: Patience before LR reduction
-        scheduler_factor: Factor to reduce LR by (default 0.1)
-        optimizer_type: Optimizer type ('sgd', 'adamw', 'adam')
         
     Returns:
         Tuple of (optimizer, scheduler)
@@ -1166,45 +1136,29 @@ def setup_pai_optimizer(
     if not PAI_AVAILABLE:
         raise RuntimeError("PerforatedAI not installed.")
     
-    # Select optimizer class based on type (to match baseline)
-    optimizer_name = optimizer_type.lower()
-    if optimizer_name == 'sgd':
-        optimizer_class = torch.optim.SGD
-        optim_args = {
-            'lr': lr,
-            'momentum': 0.937,  # Standard YOLO momentum (same as baseline)
-            'weight_decay': weight_decay
-        }
-    elif optimizer_name == 'adamw':
-        optimizer_class = torch.optim.AdamW
-        optim_args = {
-            'lr': lr,
-            'weight_decay': weight_decay
-        }
-    elif optimizer_name == 'adam':
-        optimizer_class = torch.optim.Adam
-        optim_args = {
-            'lr': lr,
-            'weight_decay': weight_decay
-        }
-    else:
-        raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
-    
     # Register optimizer and scheduler types with PAI
-    GPA.pai_tracker.set_optimizer(optimizer_class)
+    GPA.pai_tracker.set_optimizer(torch.optim.AdamW)
     GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.ReduceLROnPlateau)
+    
+    # Optimizer arguments - NOTE: DO NOT pass 'params' here!
+    # PAI's setup_optimizer will handle getting params based on mode (n vs p)
+    # Passing model.parameters() directly can result in empty list if filtered
+    optim_args = {
+        'lr': lr,
+        'weight_decay': weight_decay  # Should be 0 for PAI!
+    }
     
     # Scheduler arguments
     # CRITICAL: patience MUST be < n_epochs_to_switch!
     sched_args = {
         'mode': 'max',  # We're maximizing score (negative loss or mAP)
         'patience': scheduler_patience,
-        'factor': scheduler_factor,  # Use configured factor
+        'factor': 0.1,  # Standard PyTorch default, used by most PAI examples
         'min_lr': 1e-6
     }
     
-    print(f"[PAI Optimizer] {optimizer_name.upper()} lr={lr}, weight_decay={weight_decay}")
-    print(f"[PAI Scheduler] patience={scheduler_patience}, factor={scheduler_factor}")
+    print(f"[PAI Optimizer] lr={lr}, weight_decay={weight_decay}")
+    print(f"[PAI Scheduler] patience={scheduler_patience}, factor=0.1")
     
     # Setup through PAI tracker
     optimizer, scheduler = GPA.pai_tracker.setup_optimizer(
@@ -1530,85 +1484,6 @@ class EarlyStopper:
         }
 
 
-# =============================================================================
-# SECTION 4.6: PAI TEST EVALUATION (CORRECT METHOD)
-# =============================================================================
-def evaluate_pai_test(
-    save_name: str,
-    data_yaml: str,
-    imgsz: int = 640,
-    device: str = 'cuda',
-    pretrained: str = 'yolo11n.pt',
-    use_perforated_bp: bool = False,
-    trained_model = None  # REQUIRED: Accept trained model directly
-) -> float:
-    """
-    PAI test evaluation using the trained model directly.
-    
-    This function REQUIRES trained_model to be passed to avoid re-initialization
-    which causes duplicate PAI config entries.
-    
-    For standalone evaluation (separate script), use test_pai_model.py instead.
-    
-    Args:
-        save_name: PAI save folder path (for logging)
-        data_yaml: Dataset YAML path
-        imgsz: Image size
-        device: Device to use
-        pretrained: Base YOLO weights (for creating YOLO wrapper)
-        use_perforated_bp: Whether PerforatedBP was used in training (unused)
-        trained_model: REQUIRED - already trained PAI model
-    
-    Returns:
-        Test mAP@0.5
-    """
-    from ultralytics import YOLO
-    
-    print(f"\n[PAI Test] Running PAI test evaluation...")
-    print(f"  Save Name: {save_name}")
-    print(f"  Data YAML: {data_yaml}")
-    
-    # REQUIRE trained_model to be passed
-    if trained_model is None:
-        print(f"  ❌ ERROR: trained_model is required!")
-        print(f"     For standalone evaluation, use: python test_pai_model.py")
-        return 0.0
-    
-    try:
-        print(f"  ✅ Using trained model directly (no re-initialization)")
-        
-        # Create fresh YOLO wrapper
-        yolo = YOLO(pretrained)
-        
-        # Use the trained model directly
-        model = trained_model
-        model.eval()
-        model = model.to(device)
-        
-        # Prevent fuse() call which breaks PAI modules
-        model.is_fused = lambda: True
-        yolo.model = model
-        
-        # Run test evaluation
-        results = yolo.val(
-            data=data_yaml,
-            imgsz=imgsz,
-            split='test',
-            verbose=True,
-            workers=0,
-        )
-        test_map50 = float(results.box.map50)
-        
-        print(f"\n[PAI Test] ✅ Test mAP50: {test_map50:.4f}")
-        return test_map50
-        
-    except Exception as e:
-        print(f"[PAI Test] ❌ Test evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return 0.0
-
-
 def train_pai_yolo(
     data_yaml: str,
     epochs: int = 300,
@@ -1616,7 +1491,7 @@ def train_pai_yolo(
     imgsz: int = 640,
     device: str = 'cuda',
     lr: float = 0.005,
-    warmup_epochs: int = 3,
+    warmup_epochs: int = 3,  # NEW: Warmup period
     save_name: str = 'PAI_YOLO',
     pretrained: str = 'yolo11n.pt',
     seed: int = 42,
@@ -1625,23 +1500,17 @@ def train_pai_yolo(
     max_dendrites: int = 10,
     early_stop_patience: int = 10,
     use_pai: bool = True,
-    use_perforated_bp: bool = True,
-    # Sweep-specific PAI parameters
+    use_perforated_bp: bool = True,  # True=PerforatedBP, False=Open Source GD
+    # NEW: Sweep-specific PAI parameters
     history_lookback: int = 4,
-    improvement_threshold: list = None,
-    candidate_weight_init: float = None,
-    candidate_weight_init_by_main: bool = None,
-    pai_forward_function: str = None,
-    data_fraction: float = 1.0,
-    switch_mode: str = 'DOING_HISTORY',
-    scheduler_patience: int = None,
-    post_dendrite_scheduler_patience: int = None,
-    find_best_lr: bool = True,
-    dendrite_lr: float = None,
-    optimizer_type: str = 'adamw',
-    scheduler_factor: float = 0.1,
-    weight_decay: float = 0.0
-) -> Tuple[nn.Module, float, float]:
+    improvement_threshold: list = None,  # [0.01, 0.001, 0.0001, 0] or [0.001, 0.0001, 0]
+    candidate_weight_init: float = None,  # 0.1 or 0.01
+    pai_forward_function: str = None,  # 'sigmoid', 'relu', 'tanh'
+    data_fraction: float = 1.0,  # Fraction of training data to use (0.5 = 50%)
+    switch_mode: str = 'DOING_HISTORY',  # 'DOING_HISTORY' or 'DOING_FIXED'
+    scheduler_patience: int = None,  # Scheduler patience (if None, auto-calculated)
+    find_best_lr: bool = False  # PAI's automatic LR search (False uses manual decay)
+) -> Tuple[nn.Module, float]:
     """
     Complete Unified Training Function (PAI & Baseline).
     
@@ -1650,10 +1519,6 @@ def train_pai_yolo(
     """
     if use_pai and not PAI_AVAILABLE:
         raise RuntimeError("PerforatedAI not installed but use_pai=True requested.")
-    
-    # CRITICAL: Import YOLO at function start to avoid scope issues
-    # (There are conditional local imports later that confuse Python's compiler)
-    from ultralytics import YOLO
     
     print("\n" + "=" * 60)
     print(f"  {'PAI' if use_pai else 'BASELINE'} YOLO TRAINING")
@@ -1692,12 +1557,6 @@ def train_pai_yolo(
         if candidate_weight_init is not None:
             GPA.pc.set_candidate_weight_initialization_multiplier(candidate_weight_init)
             print(f"  Candidate Weight Init: {candidate_weight_init}")
-        
-        # Adaptive initialization (scale dendrite weights with main layer weights)
-        if candidate_weight_init_by_main is not None:
-            GPA.pc.set_candidate_weight_init_by_main(candidate_weight_init_by_main)
-            mode_str = "Adaptive (scaled by layer weights)" if candidate_weight_init_by_main else "Fixed (same for all layers)"
-            print(f"  Candidate Weight Init Mode: {mode_str}")
         
         if pai_forward_function is not None:
             if pai_forward_function == 'sigmoid':
@@ -1826,49 +1685,22 @@ def train_pai_yolo(
         optimizer, scheduler = setup_pai_optimizer(
             model,
             lr=lr,
-            weight_decay=weight_decay,  # Use configured weight_decay (0.01 before dendrite)
-            scheduler_patience=scheduler_patience,
-            scheduler_factor=scheduler_factor,
-            optimizer_type=optimizer_type  # Use same optimizer as baseline (SGD)
+            weight_decay=0,
+            scheduler_patience=scheduler_patience
         )
     else:
-        # Standard Optimizer with ReduceLROnPlateau
-        # Support SGD, AdamW, or Adam based on optimizer_type parameter
-        optimizer_name = optimizer_type.lower()
-        
-        if optimizer_name == 'sgd':
-            optimizer = torch.optim.SGD(
-                model.parameters(), 
-                lr=lr, 
-                momentum=0.937,  # Standard YOLO momentum
-                weight_decay=weight_decay
-            )
-            print(f"[Optimizer] Using SGD + ReduceLROnPlateau (lr={lr}, weight_decay={weight_decay}, momentum=0.937)")
-        elif optimizer_name == 'adamw':
-            optimizer = torch.optim.AdamW(
-                model.parameters(), 
-                lr=lr, 
-                weight_decay=weight_decay
-            )
-            print(f"[Optimizer] Using AdamW + ReduceLROnPlateau (lr={lr}, weight_decay={weight_decay})")
-        elif optimizer_name == 'adam':
-            optimizer = torch.optim.Adam(
-                model.parameters(), 
-                lr=lr, 
-                weight_decay=weight_decay
-            )
-            print(f"[Optimizer] Using Adam + ReduceLROnPlateau (lr={lr}, weight_decay={weight_decay})")
-        else:
-            raise ValueError(f"Unsupported optimizer type: {optimizer_type}. Choose from 'sgd', 'adamw', or 'adam'.")
-        
+        # Standard Optimizer with ReduceLROnPlateau (MATCHING DENDRITIC FOR FAIR COMPARISON)
+        # Previously used CosineAnnealing which forced LR decay regardless of improvement
+        print("[Optimizer] Using AdamW + ReduceLROnPlateau (matching dendritic setup)")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
         # Use same scheduler as dendritic for fair comparison
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 
             mode='max',  # Maximize mAP50
-            factor=scheduler_factor,
+            factor=0.1,   # Standard PyTorch default (same as PAI examples)
             patience=scheduler_patience
         )
-        print(f"[Scheduler] ReduceLROnPlateau: patience={scheduler_patience}, factor={scheduler_factor}")
+        print(f"[Scheduler] ReduceLROnPlateau: patience={scheduler_patience}, factor=0.1")
     
     # Warmup scheduler - gradual LR increase for first few epochs
     def get_warmup_factor(epoch):
@@ -1900,10 +1732,6 @@ def train_pai_yolo(
     best_score = float('-inf')
     best_model_state = None  # Store copy of best model's state_dict for proper evaluation
     training_history = []
-    
-    # PAI tracking variables - initialize ONCE before loop
-    pai_mode = "N"
-    pai_dendrites = 0
     
     print(f"\n{'=' * 60}")
     print(f"  STARTING TRAINING: {epochs} epochs")
@@ -1955,8 +1783,8 @@ def train_pai_yolo(
         
         restructured = False
         training_complete = False
-        # NOTE: pai_mode and pai_dendrites are persistent (initialized before loop)
-        # They are only updated when PAI actually restructures
+        pai_mode = "N"  # Initialize for PAI status display
+        pai_dendrites = 0
         
         # ========== Report to PAI (Only if use_pai) ==========
         if use_pai:
@@ -1995,11 +1823,12 @@ def train_pai_yolo(
                 
                 model = model.to(device)
                 
-                # Update PAI mode (always check current mode)
+                # Update PAI mode and dendrite info for display
                 try:
                     if hasattr(GPA, 'pai_tracker') and hasattr(GPA.pai_tracker, 'member_vars'):
                         tracker = GPA.pai_tracker
                         pai_mode = tracker.member_vars.get('mode', 'N').upper()
+                        pai_dendrites = tracker.member_vars.get('num_dendrites_added', 0)
                 except:
                     pass
                 
@@ -2014,17 +1843,7 @@ def train_pai_yolo(
             # Forcing re-enable would interfere with PAI's phased training.
             
             if restructured:
-                # Get actual dendrite count AFTER restructuring
-                try:
-                    if hasattr(GPA, 'pai_tracker') and hasattr(GPA.pai_tracker, 'member_vars'):
-                        pai_dendrites = GPA.pai_tracker.member_vars.get('num_dendrites_added', 0)
-                except:
-                    pai_dendrites += 1  # Fallback estimate
-                
-                print(f"\n  {'=' * 70}")
-                print(f"  ⚡ DENDRITE #{pai_dendrites} ADDED AT EPOCH {epoch}!")
-                print(f"  {'=' * 70}")
-                print(f"  [PAI] Resetting optimizer for dendrite training...")
+                print(f"\n  {'[PAI]':<20} {'⚡ DENDRITES ADDED! Resetting optimizer...':<46}")
                 
                 # Determine post-dendrite LR based on find_best_lr setting
                 # Following PAI's approach:
@@ -2055,30 +1874,17 @@ def train_pai_yolo(
                     post_dendrite_lr = lr / lr_divisor
                     print(f"  {'[PAI]':<20} Manual LR decay: Dendrite #{current_dendrites}, LR/{lr_divisor:.0f} = {post_dendrite_lr:.6f}")
                 else:
-                    # When find_best_lr=True, use dendrite_lr (or base lr if not specified)
-                    # WORKING CONFIG: dendrite_lr=0.005 gives the "spike up" behavior seen in successful runs
-                    # This resets LR to a higher value when dendrite is added, allowing dendrite to learn effectively
-                    if dendrite_lr is not None:
-                        post_dendrite_lr = dendrite_lr
-                        print(f"  {'[PAI]':<20} LR RESET to dendrite_lr: {post_dendrite_lr:.6f} (PAI will auto-test LRs)")
-                    else:
-                        # Fallback to base LR if dendrite_lr not specified
-                        post_dendrite_lr = lr
-                        print(f"  {'[PAI]':<20} Using base LR: {post_dendrite_lr:.6f} (PAI will auto-test LRs)")
+                    # When find_best_lr=True, use base LR (PAI tests LRs internally)
+                    # Following PAI EfficientNet example: just use base 'learning_rate'
+                    post_dendrite_lr = lr
+                    print(f"  {'[PAI]':<20} Using base LR: {post_dendrite_lr:.6f} (PAI will auto-test LRs)")
                 
                 optimizer, scheduler = setup_pai_optimizer(
                     model,
                     lr=post_dendrite_lr,
-                    # CRITICAL: weight_decay=0 after dendrite addition
-                    # PAI docs: "Weight decay can have negative impact on dendritic models"
-                    # Use 0.01 before dendrite, 0 after (to protect new dendrite weights)
-                    weight_decay=0,  # Force 0 after dendrite
-                    # Use post_dendrite_scheduler_patience if specified, otherwise fall back to pre-dendrite patience
-                    scheduler_patience=post_dendrite_scheduler_patience if post_dendrite_scheduler_patience is not None else scheduler_patience,
-                    scheduler_factor=scheduler_factor,
-                    optimizer_type=optimizer_type  # Keep same optimizer type (SGD)
+                    weight_decay=0,
+                    scheduler_patience=scheduler_patience
                 )
-                print(f"  {'[SCHED]':<20} Post-dendrite scheduler patience: {post_dendrite_scheduler_patience if post_dendrite_scheduler_patience is not None else scheduler_patience}")
                 
                 # DIAGNOSTIC: Check trainable params after restructuring
                 trainable_count = sum(1 for p in model.parameters() if p.requires_grad)
@@ -2103,8 +1909,12 @@ def train_pai_yolo(
                 
                 # EMA disabled - no re-initialization needed
                 
-                # Dendrite count was updated above when restructured=True was detected
-                # No need to re-read here
+                # Re-read dendrite count AFTER restructuring (it updates during add_validation_score)
+                try:
+                    if hasattr(GPA, 'pai_tracker') and hasattr(GPA.pai_tracker, 'member_vars'):
+                        pai_dendrites = GPA.pai_tracker.member_vars.get('num_dendrites_added', 0)
+                except:
+                    pass
             
             # Display PAI status (after any restructuring)
             print(f"  [PAI] Mode: {pai_mode} | Dendrites: {pai_dendrites}")
@@ -2197,20 +2007,8 @@ def train_pai_yolo(
             # Try primary save path, fallback to backup if needed
             save_path = save_dir / 'best_model.pt'
             try:
-                # For PAI models: Use UPA.save_system() which saves in safetensors format
-                # This is required for UPA.load_system() to work correctly
-                if use_pai:
-                    try:
-                        UPA.save_system(model, str(save_dir), 'best_model')
-                        print(f"  ✅ NEW BEST mAP@0.5: {val_score:.4f} (PAI saved)")
-                    except Exception as pai_e:
-                        print(f"  ⚠️ PAI save_system failed: {pai_e}, using torch.save")
-                        torch.save(checkpoint, save_path)
-                        print(f"  ✅ NEW BEST mAP@0.5: {val_score:.4f} (torch saved)")
-                else:
-                    # Baseline: Use standard torch.save
-                    torch.save(checkpoint, save_path)
-                    print(f"  ✅ NEW BEST mAP@0.5: {val_score:.4f} (saved)\n")
+                torch.save(checkpoint, save_path)
+                print(f"  ✅ NEW BEST mAP@0.5: {val_score:.4f} (saved)\n")
             except OSError as e:
                 # Fallback: save in current directory
                 fallback_path = Path(f"best_model_backup_{epoch}.pt")
@@ -2309,90 +2107,15 @@ def train_pai_yolo(
             print(f"[SAVE] PAI graphs saved to: {save_dir}")
         except Exception as e:
             print(f"[SAVE] Warning: PAI save_graphs failed: {e}")
+    # NOTE: Test evaluation is handled in run_experiments.py using validate() function
+    # yolo.val() fails on PAI-wrapped models due to internal fuse() call
     
-    # ========== TEST EVALUATION ==========
-    # For PAI models: Use CORRECT method (evaluate_pai_test) with UPA.load_system()
-    # For Baseline: Use simple state_dict loading
-    test_map50 = 0.0
-    
-    if use_pai:
-        # PAI CORRECT TEST EVALUATION
-        # CRITICAL: Use UPA.load_system() to properly load the dendritic model
-        # Manual state_dict loading doesn't work for PAI models with dendrites!
-        print("\n[Test] Running PAI test evaluation...")
-        
-        # Get save_name basename for PAI (PAI uses basename internally)
-        save_name_basename = os.path.basename(os.path.abspath(str(save_dir)))
-        
-        # Check if best_model.pt exists (saved by PAI during training)
-        best_model_path = save_dir / "best_model.pt"
-        if best_model_path.exists():
-            print(f"  [Loading] Found PAI best model: {best_model_path}")
-            
-            # CORRECT WAY: Use UPA.load_system() to load the dendritic model
-            # This properly reconstructs the model architecture with dendrites
-            try:
-                model = UPA.load_system(model, save_name_basename, 'best_model', switch_call=True)
-                model = model.to(device)
-                print("  [Loading] ✅ PAI best model loaded with UPA.load_system()")
-            except Exception as e:
-                print(f"  [Loading] ⚠️ UPA.load_system failed: {e}")
-                print(f"  [Loading] Using current model state instead")
-        else:
-            print(f"  [Loading] No PAI best_model.pt found, using current model")
-        
-        test_map50 = evaluate_pai_test(
-            save_name=str(save_dir),
-            data_yaml=data_yaml,
-            imgsz=imgsz,
-            device=str(device),
-            pretrained=pretrained,
-            use_perforated_bp=use_perforated_bp,
-            trained_model=model
-        )
-    else:
-        # BASELINE TEST EVALUATION
-        # Simple state_dict loading works for baseline
-        print("\n[Test] Running baseline test evaluation...")
-        if best_model_state is not None:
-            model.load_state_dict(best_model_state, strict=False)
-        
-        try:
-            from ultralytics import YOLO
-            val_yolo = YOLO(pretrained)
-            val_yolo.model = model
-            
-            test_results = val_yolo.val(
-                data=data_yaml,
-                imgsz=imgsz,
-                split='test',
-                verbose=True,
-                workers=0,
-            )
-            test_map50 = float(test_results.box.map50)
-            print(f"\n[Test] ✅ Test mAP50: {test_map50:.4f}")
-        except Exception as e:
-            print(f"[Test] ❌ Test evaluation failed: {e}")
-            import traceback
-            traceback.print_exc()
-            test_map50 = 0.0
-    
-    
-    # 5. Save final summary JSON with ACTUAL test_mAP50 and dendrite count
-    final_dendrite_count = 0
-    if use_pai:
-        try:
-            if hasattr(GPA, 'pai_tracker') and hasattr(GPA.pai_tracker, 'member_vars'):
-                final_dendrite_count = GPA.pai_tracker.member_vars.get('num_dendrites_added', 0)
-        except:
-            pass
-    
+    # 5. Save final summary JSON (test_mAP50 will be updated by run_experiments.py)
     summary = {
         'experiment_type': 'PAI' if use_pai else 'Baseline',
         'best_val_mAP50': round(best_score, 4),
-        'test_mAP50': round(test_map50, 4),  # ACTUAL test score
+        'test_mAP50': 0.0,  # Will be updated by run_experiments.py
         'total_epochs': len(training_history),
-        'dendrites_added': final_dendrite_count,  # Actual count from PAI
         'pai_enabled': use_pai,
         'config': {
             'epochs': epochs,
@@ -2413,21 +2136,37 @@ def train_pai_yolo(
     
     print(f"\n{'=' * 60}")
     print(f"  TRAINING FINISHED")
-    print(f"  ⭐️ Test mAP50: {test_map50:.4f}")
-    print(f"  --------------------------------------------------")
     print(f"  Best Val mAP50: {best_score:.4f}")
-    if use_pai:
-        print(f"  Dendrites Added: {final_dendrite_count}")
     print(f"  Results saved to: {save_dir}")
     print(f"{'=' * 60}\n")
     
-    # For backward compatibility, still load best model into returned model
-    # (though test eval is now done inside this function)
-    if not use_pai and best_model_state is not None:
-        model.load_state_dict(best_model_state, strict=False)
+    # Restore best model weights before returning (for test evaluation in run_experiments.py)
+    if best_model_state is not None:
+        # CRITICAL: Handle PAI tracker_string size mismatches
+        # tracker_string is a PAI internal buffer that changes size when dendrites are added
+        # PyTorch strict=False doesn't handle SIZE mismatches, only missing/unexpected keys
+        # So we must filter out size-mismatched keys manually
+        current_state = model.state_dict()
+        filtered_state = {}
+        skipped_keys = []
+        
+        for key, value in best_model_state.items():
+            if key in current_state:
+                if current_state[key].shape == value.shape:
+                    filtered_state[key] = value
+                else:
+                    skipped_keys.append(key)
+            else:
+                # Key doesn't exist in current model (dendrite was added after save)
+                skipped_keys.append(key)
+        
+        # Load the compatible weights
+        model.load_state_dict(filtered_state, strict=False)
+        
+        if skipped_keys:
+            print(f"  [Loaded] Best model (skipped {len(skipped_keys)} PAI buffers with size mismatch)")
     
-    # Return model, val score, AND test score
-    return model, best_score, test_map50
+    return model, best_score
 
 
 # =============================================================================
@@ -2511,8 +2250,7 @@ def train_pai_yolo_simple(
         model,
         lr=lr,
         weight_decay=0,
-        scheduler_patience=scheduler_patience,
-        optimizer_type='sgd'  # Match baseline optimizer
+        scheduler_patience=scheduler_patience
     )
     
     # Create save directory
@@ -2577,8 +2315,7 @@ def train_pai_yolo_simple(
                 model,
                 lr=lr,
                 weight_decay=0,
-                scheduler_patience=scheduler_patience,
-                optimizer_type='sgd'  # Match baseline optimizer
+                scheduler_patience=scheduler_patience
             )
         
         # Update scheduler
