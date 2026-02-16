@@ -13,9 +13,6 @@ Uses same seed (42) and data split as main experiments.
 import os
 import sys
 
-# Set PAI credentials BEFORE importing
-os.environ["PAIEMAIL"] = "hacker@perforatedai.com"
-os.environ["PAITOKEN"] = "InJ9BjZSB+B+l30bmSzhqOwsXxOx0NRKAe8dtdAqdQcT/pKjmme1fqB1zrnCd5CWNrhJm40PVjaDbIrjR5xU+q2uhcUWX8gk2Kb2lHjafkUnizPXyP+yckbv+UxlU25ZlrvC3XlLu/AZdVKJE7Eov9+4c76sKe2hbRnH1fny2xIPYmy2/m/sY1gxXbhPtTa1mtxk2EgLeo5pRu/eL/7pSXWmEoRmvVorgQEJzt1VYOZyp0vP4bLxF72tOgSjXGBO8SHHcN16CbOVJuIEm3jmEc/AfPyyB+G4TEqhH7UZ0W2R/bnXtNberKqF2bQTuyT26etQw6NEMoXwuugDcrBXEw=="
 os.environ["PYTHONBREAKPOINT"] = "0"
 
 import torch
